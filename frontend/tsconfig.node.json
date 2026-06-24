@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    /* Config para ficheiros que correm no Node (vite.config.ts, postcss, etc.) */
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}

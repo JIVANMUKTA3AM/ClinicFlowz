@@ -1,0 +1,75 @@
+# ─── docker-compose.yml — Produção ───────────────────────────────────────────
+# "version:" removido (obsoleto desde Docker Compose v2).
+#
+# Variáveis necessárias no .env da raiz:
+#
+#   Backend (runtime):
+#     SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY,
+#     WAHA_URL, WAHA_API_KEY, ENCRYPTION_KEY
+#
+#   Frontend (build-time — injectadas pelo Vite no bundle):
+#     VITE_SUPABASE_URL       → mesmo valor que SUPABASE_URL
+#     VITE_SUPABASE_ANON_KEY  → chave anon/public do Supabase
+#                               (Dashboard → Settings → API → "anon public")
+#                               ⚠ NÃO é SUPABASE_SERVICE_KEY
+#
+# Uso:
+#   docker compose up --build -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend FastAPI ──────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: clinicflowz_api
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./app:/app/app
+    expose:
+      - "8000"
+    healthcheck:
+      # python:3.12-slim não tem curl nem wget.
+      # urllib é stdlib — funciona em qualquer imagem Python.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s    # tempo para pip install + uvicorn boot
+
+  # ── Frontend React (build + nginx serve) ────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL:      ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
+        VITE_API_URL:           ""
+    container_name: clinicflowz_frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Reverse proxy nginx ──────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: clinicflowz_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - api
+      - frontend

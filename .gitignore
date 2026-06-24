@@ -1,0 +1,59 @@
+# ── Credenciais e segredos ───────────────────────────────────────────────────
+# NUNCA commitar estes ficheiros — contêm chaves, tokens e URLs de projecto
+.env
+.env.*
+!.env.local.example      # template SEM valores reais — pode ser commitado
+.env.waha-test           # explícito além do .env.* (redundante mas claro)
+
+# Frontend env files
+frontend/.env            # ← CRÍTICO: tem anon key do Supabase
+frontend/.env.*
+!frontend/.env.local.example
+
+# Docker — configs de desenvolvimento local (não vão para produção/CI)
+docker-compose.override.yml
+docker-compose.dev.yml
+docker-compose.waha.yml
+
+# Certificados e chaves locais
+certs/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.eggs/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Pytest / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+*.log
