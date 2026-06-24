@@ -1,20 +1,25 @@
-# ─── docker-compose.yml — Produção ───────────────────────────────────────────
-# "version:" removido (obsoleto desde Docker Compose v2).
+# ─── docker-compose.yml — Produção (EasyPanel) ───────────────────────────────
 #
-# Variáveis necessárias no .env da raiz:
+# Arquitectura:
+#   Traefik (EasyPanel) → nginx:80 → { /api/* → api:8000
+#                                     /       → frontend:80 }
 #
-#   Backend (runtime):
-#     SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY,
-#     WAHA_URL, WAHA_API_KEY, ENCRYPTION_KEY
+# Variáveis de ambiente — configurar na aba "Ambiente" do EasyPanel:
 #
-#   Frontend (build-time — injectadas pelo Vite no bundle):
-#     VITE_SUPABASE_URL       → mesmo valor que SUPABASE_URL
-#     VITE_SUPABASE_ANON_KEY  → chave anon/public do Supabase
-#                               (Dashboard → Settings → API → "anon public")
-#                               ⚠ NÃO é SUPABASE_SERVICE_KEY
+#   Runtime (backend):
+#     SUPABASE_URL          URL do projecto Supabase
+#     SUPABASE_SERVICE_KEY  service_role key (NUNCA expor no frontend)
+#     ANTHROPIC_API_KEY     chave Anthropic
+#     WAHA_URL              URL do WAHA na VPS
+#     WAHA_API_KEY          API key do WAHA
+#     ENCRYPTION_KEY        chave Fernet (gerar: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+#     BACKEND_WEBHOOK_URL   URL pública do backend (ex: https://api.seudominio.com)
 #
-# Uso:
-#   docker compose up --build -d
+#   Build-time frontend — também na aba "Ambiente" do EasyPanel
+#   (o Compose substitui ${VAR} antes do build):
+#     VITE_SUPABASE_URL     mesmo valor que SUPABASE_URL
+#     VITE_SUPABASE_ANON_KEY  chave anon/public (≠ service_role)
+#
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -24,14 +29,12 @@ services:
     build: .
     container_name: clinicflowz_api
     restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./app:/app/app
+    # env_file removido — EasyPanel injeta variáveis de ambiente directamente.
+    # Configure tudo na aba "Ambiente" do EasyPanel (nunca commitar .env).
     expose:
       - "8000"
     healthcheck:
-      # python:3.12-slim não tem curl nem wget.
-      # urllib é stdlib — funciona em qualquer imagem Python.
+      # python:3.12-slim não tem curl — urllib é stdlib Python.
       test:
         - CMD
         - python
@@ -40,16 +43,21 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s    # tempo para pip install + uvicorn boot
+      start_period: 30s
 
-  # ── Frontend React (build + nginx serve) ────────────────────────────────────
+  # ── Frontend React (build + nginx interno serve) ─────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
+        # ${VAR} é substituído pelo Compose usando as variáveis da aba "Ambiente".
+        # No EasyPanel: definir VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY
+        # na aba "Ambiente" para que o build do Vite as inclua no bundle.
         VITE_SUPABASE_URL:      ${VITE_SUPABASE_URL}
         VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
+        # Vazio → frontend usa URLs relativas (/api/...) → nginx roteia para api.
+        # NÃO mudar para URL absoluta — o nginx deste compose já faz o proxy.
         VITE_API_URL:           ""
     container_name: clinicflowz_frontend
     restart: unless-stopped
@@ -59,17 +67,22 @@ services:
       api:
         condition: service_healthy
 
-  # ── Reverse proxy nginx ──────────────────────────────────────────────────────
+  # ── Reverse proxy nginx (entrada única para o EasyPanel/Traefik) ─────────────
+  # O Traefik do EasyPanel termina o SSL e encaminha HTTP para nginx:80.
+  # nginx roteia internamente: /api/* → api:8000 | / → frontend:80.
+  # SEM "ports:" — nenhuma porta é exposta directamente no host.
+  # O EasyPanel expõe este serviço via domínio configurado na sua UI.
   nginx:
     image: nginx:1.27-alpine
     container_name: clinicflowz_nginx
     restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
+    expose:
+      - "80"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # nginx.conf está commitado no repo — sem :ro para evitar o erro
+      # do script IPv6 do nginx:alpine ("cannot modify read-only file").
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      # /etc/letsencrypt REMOVIDO — Traefik/EasyPanel gerencia SSL.
     depends_on:
       - api
       - frontend
