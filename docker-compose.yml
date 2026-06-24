@@ -1,24 +1,31 @@
-# ─── docker-compose.yml — Produção (EasyPanel) ───────────────────────────────
+# ─── docker-compose.yml — Produção (EasyPanel + Traefik) ─────────────────────
 #
-# Arquitectura:
-#   Traefik (EasyPanel) → nginx:80 → { /api/* → api:8000
-#                                     /       → frontend:80 }
+# Arquitectura (2 serviços):
+#   Traefik (EasyPanel) → frontend:80 ─┬─ /api/* → api:8000 (proxy interno nginx)
+#                                       └─ /      → React SPA (ficheiros estáticos)
 #
-# Variáveis de ambiente — configurar na aba "Ambiente" do EasyPanel:
+# O EasyPanel expõe o serviço "frontend" no domínio configurado.
+# O Traefik termina SSL. O nginx interno do frontend roteia /api/ para o api.
+# Sem serviço nginx separado. Sem bind de portas no host.
 #
-#   Runtime (backend):
-#     SUPABASE_URL          URL do projecto Supabase
-#     SUPABASE_SERVICE_KEY  service_role key (NUNCA expor no frontend)
-#     ANTHROPIC_API_KEY     chave Anthropic
-#     WAHA_URL              URL do WAHA na VPS
-#     WAHA_API_KEY          API key do WAHA
-#     ENCRYPTION_KEY        chave Fernet (gerar: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-#     BACKEND_WEBHOOK_URL   URL pública do backend (ex: https://api.seudominio.com)
+# ─── VARIÁVEIS — aba "Ambiente" do EasyPanel ─────────────────────────────────
 #
-#   Build-time frontend — também na aba "Ambiente" do EasyPanel
-#   (o Compose substitui ${VAR} antes do build):
-#     VITE_SUPABASE_URL     mesmo valor que SUPABASE_URL
-#     VITE_SUPABASE_ANON_KEY  chave anon/public (≠ service_role)
+#   Runtime (backend — injectadas directamente nos containers):
+#     SUPABASE_URL            URL do projecto Supabase
+#     SUPABASE_SERVICE_KEY    service_role key (NUNCA expor no frontend)
+#     ANTHROPIC_API_KEY       chave Anthropic
+#     WAHA_URL                URL do WAHA
+#     WAHA_API_KEY            API key do WAHA
+#     ENCRYPTION_KEY          chave Fernet
+#     BACKEND_WEBHOOK_URL     URL pública deste serviço (ex: https://app.dominio.com)
+#
+#   Build-time frontend (Vite lê em build e injeta no bundle JS):
+#     VITE_SUPABASE_URL       mesmo valor que SUPABASE_URL
+#     VITE_SUPABASE_ANON_KEY  chave anon/public (≠ service_role!)
+#
+#   O Compose substitui ${VAR} com os valores do Ambiente antes do build,
+#   passando-os como --build-arg para o Dockerfile do frontend.
+#   NÃO é necessária configuração extra de build args no EasyPanel.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -29,12 +36,11 @@ services:
     build: .
     container_name: clinicflowz_api
     restart: unless-stopped
-    # env_file removido — EasyPanel injeta variáveis de ambiente directamente.
-    # Configure tudo na aba "Ambiente" do EasyPanel (nunca commitar .env).
+    # Sem env_file — EasyPanel injeta todas as variáveis da aba "Ambiente".
     expose:
       - "8000"
     healthcheck:
-      # python:3.12-slim não tem curl — urllib é stdlib Python.
+      # python:3.12-slim não tem curl; urllib é stdlib — funciona sempre.
       test:
         - CMD
         - python
@@ -45,19 +51,21 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── Frontend React (build + nginx interno serve) ─────────────────────────────
+  # ── Frontend React + nginx (entrada única exposta pelo Traefik) ──────────────
+  # Este serviço faz DOIS trabalhos:
+  #   1. Serve os ficheiros estáticos do React (/)
+  #   2. Proxia /api/* para api:8000 (via nginx interno — ver nginx-spa.conf)
+  #
+  # É o ÚNICO serviço a expor no domínio do EasyPanel (porta 80).
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # ${VAR} é substituído pelo Compose usando as variáveis da aba "Ambiente".
-        # No EasyPanel: definir VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY
-        # na aba "Ambiente" para que o build do Vite as inclua no bundle.
+        # Substituídos pelo Compose com os valores da aba "Ambiente" do EasyPanel.
         VITE_SUPABASE_URL:      ${VITE_SUPABASE_URL}
         VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
-        # Vazio → frontend usa URLs relativas (/api/...) → nginx roteia para api.
-        # NÃO mudar para URL absoluta — o nginx deste compose já faz o proxy.
+        # Vazio → o bundle usa URLs relativas (/api/...) → nginx faz o proxy.
         VITE_API_URL:           ""
     container_name: clinicflowz_frontend
     restart: unless-stopped
@@ -66,23 +74,3 @@ services:
     depends_on:
       api:
         condition: service_healthy
-
-  # ── Reverse proxy nginx (entrada única para o EasyPanel/Traefik) ─────────────
-  # O Traefik do EasyPanel termina o SSL e encaminha HTTP para nginx:80.
-  # nginx roteia internamente: /api/* → api:8000 | / → frontend:80.
-  # SEM "ports:" — nenhuma porta é exposta directamente no host.
-  # O EasyPanel expõe este serviço via domínio configurado na sua UI.
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: clinicflowz_nginx
-    restart: unless-stopped
-    expose:
-      - "80"
-    volumes:
-      # nginx.conf está commitado no repo — sem :ro para evitar o erro
-      # do script IPv6 do nginx:alpine ("cannot modify read-only file").
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf
-      # /etc/letsencrypt REMOVIDO — Traefik/EasyPanel gerencia SSL.
-    depends_on:
-      - api
-      - frontend
