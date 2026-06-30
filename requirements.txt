@@ -10,3 +10,5 @@ PyJWT==2.8.0
 python-dotenv==1.0.1
 apscheduler>=3.10.4
 cryptography>=42.0.0
+redis>=4.6.0
+openai>=1.30.0

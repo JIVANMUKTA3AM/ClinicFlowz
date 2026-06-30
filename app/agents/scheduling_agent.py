@@ -117,6 +117,7 @@ class SchedulingAgent(BaseAgent):
             api_key=api_key,
             max_tokens=1024,
             max_iterations=10,
+            g3_gates={"create_appointment": "list_available_slots"},
         )
 
     async def execute_tool(self, tool_name: str, tool_input: dict) -> Any:

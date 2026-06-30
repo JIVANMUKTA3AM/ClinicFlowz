@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import datetime, timezone, date as date_type
 from typing import Any
 
@@ -6,6 +8,19 @@ from supabase import Client
 from app.agents.base_agent import BaseAgent
 from app.agents.prompts import get_whatsapp_prompt
 from app.core.config import settings
+from app.services import profile_updater
+from app.services.prompt_builder import (
+    default_snapshot,
+    detect_stage_from_response,
+    format_playbook_block,
+    format_profile_block,
+    format_snapshot_block,
+    get_blocked_tools,
+)
+
+logger = logging.getLogger(__name__)
+
+_INACTIVITY_MINUTES = 30
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +112,25 @@ _TOOLS = [
             "properties": {},
             "required": []
         }
+    },
+    {
+        "name": "search_kb",
+        "description": (
+            "Busca na base de conhecimento da clínica. "
+            "Use SEMPRE que o paciente perguntar sobre serviços, preços, procedimentos, "
+            "FAQ, localização, horários ou qualquer informação da clínica. "
+            "Nunca inventes informações — consulta sempre a KB primeiro."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A pergunta ou tema a pesquisar (ex: 'quanto custa botox', 'endereço da clínica')"
+                }
+            },
+            "required": ["query"]
+        }
     }
 ]
 
@@ -106,18 +140,55 @@ _TOOLS = [
 class WhatsAppAgent(BaseAgent):
     """WhatsApp agent. Persona and language selected by `pais` at construction time."""
 
-    def __init__(self, paciente: dict, clinica_id: str, db: Client, pais: str = "PT") -> None:
+    def __init__(
+        self,
+        paciente: dict,
+        clinica_id: str,
+        db: Client,
+        pais: str = "PT",
+        blocked_tools: list[str] | None = None,
+        conversation_id: str = "",
+    ) -> None:
+        active_tools = (
+            [t for t in _TOOLS if t["name"] not in blocked_tools]
+            if blocked_tools
+            else _TOOLS
+        )
         super().__init__(
             system_prompt=get_whatsapp_prompt(pais),
-            tools=_TOOLS,
+            tools=active_tools,
             api_key=settings.ANTHROPIC_API_KEY,
             max_tokens=2048,
+            g3_gates={"agendar_consulta": "verificar_slots"},
         )
         self._paciente = paciente
         self._clinica_id = clinica_id
         self._db = db
+        self._conversation_id = conversation_id
+
+    async def _on_g3_violation(self, attempted_tool: str, required_tool: str) -> None:
+        """Log G3 gate trigger to wa_audit_log."""
+        await super()._on_g3_violation(attempted_tool, required_tool)
+        try:
+            self._db.table("wa_audit_log").insert({
+                "clinica_id": self._clinica_id,
+                "conversation_id": self._conversation_id or None,
+                "event_type": "g3_gate_triggered",
+                "payload": {
+                    "attempted_tool": attempted_tool,
+                    "required_tool": required_tool,
+                    "turn_number": self._turn_count,
+                    "patient_id": self._paciente.get("id"),
+                },
+            }).execute()
+        except Exception:
+            logger.exception("G3 audit log insert failed | clinica=%s", self._clinica_id)
 
     async def execute_tool(self, tool_name: str, tool_input: dict) -> Any:
+        # search_kb is async (OpenAI API call) — handled separately
+        if tool_name == "search_kb":
+            return await self._buscar_kb(tool_input)
+
         dispatch = {
             "buscar_medicos":              self._buscar_medicos,
             "verificar_slots":             self._verificar_slots,
@@ -344,6 +415,13 @@ class WhatsAppAgent(BaseAgent):
 
         return "Consentimento de privacidade registado com sucesso."
 
+    async def _buscar_kb(self, args: dict) -> str:
+        from app.services.kb_service import search_kb
+        query = args.get("query", "")
+        if not query:
+            return "Por favor especifica o que queres pesquisar."
+        return await search_kb(self._db, query, self._clinica_id)
+
 
 # ─── Helpers de contexto ──────────────────────────────────────────────────────
 
@@ -367,6 +445,97 @@ def _formatar_historico(historico: list) -> str:
     )
 
 
+# ─── Snapshot persistence ─────────────────────────────────────────────────────
+
+def _load_snapshot(
+    db: Client, clinica_id: str, paciente_id: str, telefone: str
+) -> tuple[dict, dict]:
+    """
+    Loads context_snapshot from wa_conversations.
+    Returns (snapshot, row) — row includes updated_at for inactivity checks.
+    Creates the row with a default snapshot when it doesn't exist yet.
+    """
+    res = (
+        db.table("wa_conversations")
+        .select("id, context_snapshot, updated_at")
+        .eq("clinica_id", clinica_id)
+        .eq("telefone", telefone)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        row = res.data[0]
+        snap = row.get("context_snapshot") or {}
+        return (snap if snap else default_snapshot()), row
+
+    snap = default_snapshot()
+    db.table("wa_conversations").upsert(
+        {
+            "clinica_id": clinica_id,
+            "paciente_id": paciente_id,
+            "telefone": telefone,
+            "context_snapshot": snap,
+        },
+        on_conflict="clinica_id,telefone",
+    ).execute()
+    return snap, {}
+
+
+def _load_playbook(db: Client, clinica_id: str) -> dict:
+    """Loads agent_playbook from wa_agents. Returns {} if not configured."""
+    try:
+        res = (
+            db.table("wa_agents")
+            .select("agent_playbook")
+            .eq("clinica_id", clinica_id)
+            .eq("ativo", True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("agent_playbook") or {}
+    except Exception:
+        logger.warning("Could not load playbook for clinica=%s", clinica_id)
+    return {}
+
+
+def _is_new_conversation(conv_row: dict) -> bool:
+    """True if last turn was > _INACTIVITY_MINUTES ago (implicit conversation end)."""
+    updated_at_str = conv_row.get("updated_at")
+    if not updated_at_str:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+        elapsed_min = (datetime.now(timezone.utc) - updated_at).total_seconds() / 60
+        return elapsed_min > _INACTIVITY_MINUTES
+    except (ValueError, TypeError):
+        return False
+
+
+def _save_snapshot(
+    db: Client,
+    clinica_id: str,
+    paciente_id: str,
+    telefone: str,
+    snapshot: dict,
+) -> None:
+    """Persists the updated context_snapshot back to wa_conversations."""
+    try:
+        db.table("wa_conversations").upsert(
+            {
+                "clinica_id": clinica_id,
+                "paciente_id": paciente_id,
+                "telefone": telefone,
+                "context_snapshot": snapshot,
+            },
+            on_conflict="clinica_id,telefone",
+        ).execute()
+    except Exception:
+        logger.exception(
+            "Failed to save context_snapshot | clinica=%s telefone=%s", clinica_id, telefone
+        )
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def processar_mensagem(
@@ -376,10 +545,14 @@ async def processar_mensagem(
     db: Client,
     pais: str = "PT",
 ) -> str:
+    telefone: str = paciente.get("telefone", "")
+    paciente_id: str = paciente["id"]
+    nome: str = paciente.get("nome") or "Paciente"
+
     historico_res = (
         db.table("interacoes")
         .select("tipo, direcao, conteudo, created_at")
-        .eq("paciente_id", paciente["id"])
+        .eq("paciente_id", paciente_id)
         .eq("clinica_id", clinica_id)
         .order("created_at", desc=True)
         .limit(10)
@@ -388,7 +561,7 @@ async def processar_mensagem(
     consultas_res = (
         db.table("consultas")
         .select("id, data_hora, status, tipo, medicos(nome)")
-        .eq("paciente_id", paciente["id"])
+        .eq("paciente_id", paciente_id)
         .gte("data_hora", datetime.now(timezone.utc).isoformat())
         .order("data_hora")
         .limit(3)
@@ -399,7 +572,7 @@ async def processar_mensagem(
 
     contexto = f"""=== CONTEXTO DO PACIENTE ===
 Nome: {paciente.get('nome', 'Não identificado')}
-Telefone: {paciente.get('telefone')}
+Telefone: {telefone}
 Status: {paciente.get('status')}
 Consentimento privacidade: {'Sim' if tem_consentimento else 'Não dado — peça antes de guardar dados de saúde'}
 Tags: {', '.join(paciente.get('tags') or []) or 'Nenhuma'}
@@ -413,5 +586,65 @@ Tags: {', '.join(paciente.get('tags') or []) or 'Nenhuma'}
 === MENSAGEM DO PACIENTE ===
 {mensagem}"""
 
-    agent = WhatsAppAgent(paciente=paciente, clinica_id=clinica_id, db=db, pais=pais)
-    return await agent.run(contexto)
+    # ── Load snapshot; check for inactivity gap (new conversation) ───────────
+    snapshot, conv_row = _load_snapshot(db, clinica_id, paciente_id, telefone)
+
+    if _is_new_conversation(conv_row) and snapshot.get("stage") not in ("opening", None):
+        logger.info(
+            "New conversation after inactivity | clinica=%s telefone=%s prev_stage=%s",
+            clinica_id, telefone, snapshot.get("stage"),
+        )
+        # Update profile from the previous (now ended) conversation
+        asyncio.create_task(
+            profile_updater.update_profile(db, clinica_id, paciente_id, nome)
+        )
+        snapshot = default_snapshot()
+
+    # ── Load playbook; derive blocked tools for current stage ─────────────────
+    playbook = _load_playbook(db, clinica_id)
+    stage_id = snapshot.get("stage", "opening")
+    blocked  = get_blocked_tools(playbook, stage_id)
+
+    # ── Build combined system prompt (profile + snapshot + playbook) ──────────
+    ai_profile: dict = paciente.get("ai_profile") or {}
+    profile_block  = format_profile_block(nome, ai_profile)
+    snapshot_block = format_snapshot_block(snapshot)
+    playbook_block = format_playbook_block(playbook, stage_id, mensagem)
+    extra_system   = "\n\n".join(b for b in [profile_block, snapshot_block, playbook_block] if b)
+
+    logger.debug(
+        "Turn context | clinica=%s stage=%s blocked=%s has_profile=%s has_playbook=%s",
+        clinica_id, stage_id, blocked, bool(ai_profile), bool(playbook),
+    )
+
+    agent = WhatsAppAgent(
+        paciente=paciente,
+        clinica_id=clinica_id,
+        db=db,
+        pais=pais,
+        blocked_tools=blocked or None,
+        conversation_id=conv_row.get("id", ""),
+    )
+    resposta = await agent.run(contexto, extra_system=extra_system)
+
+    # ── Detect stage transitions; persist snapshot ────────────────────────────
+    updated_snapshot = detect_stage_from_response(resposta, mensagem, snapshot)
+    _save_snapshot(db, clinica_id, paciente_id, telefone, updated_snapshot)
+
+    logger.debug(
+        "Snapshot saved | stage=%s→%s turns=%s",
+        snapshot.get("stage"), updated_snapshot.get("stage"),
+        updated_snapshot.get("turns_in_stage"),
+    )
+
+    # ── Trigger ai_profile update when conversation ends ──────────────────────
+    if updated_snapshot.get("stage") == "closing":
+        logger.info(
+            "Profile update triggered (closing) | clinica=%s paciente=%s",
+            clinica_id, paciente_id,
+        )
+        asyncio.create_task(
+            profile_updater.update_profile(db, clinica_id, paciente_id, nome)
+        )
+
+    return resposta

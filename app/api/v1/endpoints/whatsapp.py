@@ -35,7 +35,9 @@ Endpoints
   DELETE /connections/{id} — deactivate a connection          (JWT required)
 """
 
+import asyncio
 import logging
+import os
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -48,11 +50,15 @@ from app.schemas.schemas import (
     WhatsAppConnectionCreate,
     WhatsAppConnectionOut,
 )
+from app.services import message_buffer
 from app.services.agent_dispatcher import dispatch_agent
 from app.services.timeline_service import registrar_interacao
+from app.services.wa_chunker import calculate_delay_ms, split_into_chunks
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_BUFFER_TTL_SECONDS = 12
 
 # Stateless Router instance — shared across requests, thread-safe
 _router = Router(api_key=settings.ANTHROPIC_API_KEY)
@@ -182,16 +188,13 @@ async def whatsapp_webhook(
 
 async def _handle_message(payload: dict, db: Client) -> None:
     """
-    Full inbound message pipeline:
+    Inbound message pipeline — steps 1-2 run immediately per webhook call.
+    Steps 3-8 are deferred via message_buffer and run once per debounced turn.
 
     1.  Validate event type and extract fields
     2.  Resolve clinica_id from instance_name  ← multi-tenant pivot
-    3.  Find or create the patient record
-    4.  Classify intent via two-tier Router
-    5.  Record inbound interaction in the timeline
-    6.  Dispatch to the correct agent
-    7.  Send reply via Waha (scoped session)
-    8.  Record outbound interaction in the timeline
+    3.  Buffer text; schedule _process_turn after BUFFER_TTL seconds of silence
+        (steps 3–8 run inside _process_turn when the buffer flushes)
     """
     try:
         # ── 1. Validate ────────────────────────────────────────────────────
@@ -234,6 +237,48 @@ async def _handle_message(payload: dict, db: Client) -> None:
             telefone,
         )
 
+        # ── 3. Buffer + debounce ────────────────────────────────────────────
+        async def on_flush(full_text: str) -> None:
+            await _process_turn(
+                clinica_id=clinica_id,
+                instance_name=instance_name,
+                telefone=telefone,
+                texto=full_text,
+                db=db,
+            )
+
+        await message_buffer.push(
+            tenant_id=clinica_id,
+            phone=telefone,
+            text=texto,
+            ttl=_BUFFER_TTL_SECONDS,
+            on_flush=on_flush,
+        )
+
+    except Exception:
+        logger.exception("WhatsApp handler error")
+
+
+async def _process_turn(
+    *,
+    clinica_id: str,
+    instance_name: str,
+    telefone: str,
+    texto: str,
+    db: Client,
+) -> None:
+    """
+    Full agent pipeline for one debounced turn (steps 3–8).
+    Called by message_buffer once the patient has stopped typing.
+
+    3.  Find or create the patient record
+    4.  Classify intent via two-tier Router
+    5.  Record inbound interaction in the timeline
+    6.  Dispatch to the correct agent
+    7.  Send reply via Waha (scoped session)
+    8.  Record outbound interaction in the timeline
+    """
+    try:
         # ── 3. Find or create patient ───────────────────────────────────────
         res = (
             db.table("pacientes")
@@ -307,10 +352,63 @@ async def _handle_message(payload: dict, db: Client) -> None:
         })
 
     except Exception:
-        logger.exception("WhatsApp handler error")
+        logger.exception(
+            "WhatsApp process_turn error | clinica=%s telefone=%s", clinica_id, telefone
+        )
+
+
+# ─── Startup recovery factory ────────────────────────────────────────────────
+
+def make_flush_callback(tenant_id: str, phone: str):
+    """
+    Returns an on_flush coroutine for message_buffer.recover().
+    Resolves instance_name from the DB at flush time so that the factory
+    can be constructed before any DB call is needed.
+    """
+    async def on_flush(text: str) -> None:
+        db = get_supabase()
+        res = (
+            db.table("whatsapp_connections")
+            .select("instance_name")
+            .eq("clinica_id", tenant_id)
+            .eq("ativo", True)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            logger.warning(
+                "Recovery: no active WhatsApp connection for clinica=%s — dropping buffer",
+                tenant_id,
+            )
+            return
+        await _process_turn(
+            clinica_id=tenant_id,
+            instance_name=res.data[0]["instance_name"],
+            telefone=phone,
+            texto=text,
+            db=db,
+        )
+
+    return on_flush
 
 
 # ─── Waha send helper ─────────────────────────────────────────────────────────
+
+def _normalize_chat_id(telefone: str) -> str:
+    """Normaliza para '<digits>@c.us' independente do formato de entrada."""
+    return (
+        telefone.lstrip("+")
+        .replace("@c.us", "")
+        .replace("@s.whatsapp.net", "")
+        + "@c.us"
+    )
+
+
+async def _waha_post(client: httpx.AsyncClient, url: str, headers: dict, body: dict) -> int:
+    """POST helper; retorna o status code."""
+    res = await client.post(url, json=body, headers=headers)
+    return res.status_code
+
 
 async def _enviar_whatsapp(
     telefone: str,
@@ -318,33 +416,70 @@ async def _enviar_whatsapp(
     instance_name: str,
 ) -> None:
     """
-    Send a text message via Waha.
+    Envia a resposta do agente em chunks humanizados via WAHA Plus.
 
-    instance_name == Waha session name, taken from whatsapp_connections,
-    so replies always go back through the same session that received the message.
+    Para cada chunk:
+      1. Dispara startTyping (typing indicator) — ignorado com fallback se WAHA
+         não suportar o endpoint.
+      2. Aguarda o delay calculado pela velocidade de digitação simulada.
+      3. Envia o chunk via sendText.
+      4. Aguarda 400 ms antes do próximo chunk.
 
-    Phone format: Waha espera "<digits>@c.us".
-    Se telefone já vier com "@c.us" a função normaliza igualmente.
+    Phone format: WAHA espera "<digits>@c.us".
     """
-    url = f"{settings.WAHA_URL}/api/sendText"
+    chat_id = _normalize_chat_id(telefone)
     headers = {
         "X-Api-Key": settings.WAHA_API_KEY,
         "Content-Type": "application/json",
     }
-    # Normaliza para "<digits>@c.us" (remove + e sufixo se já existirem)
-    chat_id = telefone.lstrip("+").replace("@c.us", "").replace("@s.whatsapp.net", "") + "@c.us"
+    url_send   = f"{settings.WAHA_URL}/api/sendText"
+    url_typing = f"{settings.WAHA_URL}/api/startTyping"
+
+    chunks = split_into_chunks(mensagem)
+    if not chunks:
+        return
+
+    total = len(chunks)
+    logger.debug("Sending %d chunk(s) to %s | session=%s", total, telefone, instance_name)
+
+    if os.environ.get("WAHA_DEV_MODE", "").lower() == "true":
+        for i, chunk in enumerate(chunks, 1):
+            logger.info("[DEV MODE] Would send chunk %d/%d: %s", i, total, chunk)
+        return
 
     async with httpx.AsyncClient(timeout=10) as client:
-        res = await client.post(
-            url,
-            json={"chatId": chat_id, "text": mensagem, "session": instance_name},
-            headers=headers,
-        )
+        for i, chunk in enumerate(chunks):
+            delay_ms = calculate_delay_ms(chunk)
 
-    if res.status_code not in (200, 201):
-        logger.error(
-            "Waha error | session=%s status=%d body=%s",
-            instance_name,
-            res.status_code,
-            res.text[:200],
-        )
+            # ── Typing indicator ──────────────────────────────────────────────
+            try:
+                status = await _waha_post(
+                    client,
+                    url_typing,
+                    headers,
+                    {"chatId": chat_id, "session": instance_name},
+                )
+                if status not in (200, 201, 204):
+                    logger.debug("startTyping not supported (status=%d) — skipping", status)
+            except Exception:
+                logger.debug("startTyping unavailable — continuing without typing indicator")
+
+            # ── Simulated typing delay ────────────────────────────────────────
+            await asyncio.sleep(delay_ms / 1000)
+
+            # ── Send chunk ───────────────────────────────────────────────────
+            status = await _waha_post(
+                client,
+                url_send,
+                headers,
+                {"chatId": chat_id, "text": chunk, "session": instance_name},
+            )
+            if status not in (200, 201):
+                logger.error(
+                    "Waha sendText error | session=%s chunk=%d/%d status=%d",
+                    instance_name, i + 1, len(chunks), status,
+                )
+
+            # ── Inter-chunk pause ─────────────────────────────────────────────
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.4)

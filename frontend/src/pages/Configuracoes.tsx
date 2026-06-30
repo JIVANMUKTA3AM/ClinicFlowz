@@ -3,13 +3,22 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import {
   MessageSquare, Zap, CheckCircle2, XCircle, Loader2,
   AlertCircle, Save, Radio, Settings, ChevronDown, ChevronUp,
-  QrCode, Smartphone, RefreshCw,
+  QrCode, Smartphone, RefreshCw, Bot, ChevronRight, Lock,
+  BookOpen, Plus, Pencil, EyeOff, GitBranch,
 } from "lucide-react"
 import { integracoesService } from "../services/integracoes.service"
+import { agentesService } from "../services/agentes.service"
+import { kbService } from "../services/kb.service"
+import { SandboxTester } from "../components/SandboxTester"
+import { AgentHealth } from "../components/AgentHealth"
+import { AgentVersions } from "../components/AgentVersions"
 import type {
   Integracao, StatusIntegracao, TipoIntegracao,
   QRResult, SessaoStatus,
 } from "../services/integracoes.service"
+import type { WaAgent, AgentPlaybook, PlaybookStage } from "../services/agentes.service"
+import type { KbEntity, KbCategory, KbCreateDTO } from "../services/kb.service"
+import { KB_CATEGORY_LABELS } from "../services/kb.service"
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -456,25 +465,468 @@ function AbaKommo({ integracao }: { integracao: Integracao | undefined }) {
   )
 }
 
+// ─── Agente IA Tab ────────────────────────────────────────────────────────────
+
+const STAGE_COLORS: Record<string, { bg: string; border: string; dot: string }> = {
+  opening:       { bg: "bg-blue-50",    border: "border-blue-100",   dot: "bg-blue-400" },
+  discovery:     { bg: "bg-violet-50",  border: "border-violet-100", dot: "bg-violet-400" },
+  qualification: { bg: "bg-amber-50",   border: "border-amber-100",  dot: "bg-amber-400" },
+  scheduling:    { bg: "bg-emerald-50", border: "border-emerald-100",dot: "bg-emerald-500" },
+  closing:       { bg: "bg-surface-50", border: "border-surface-100",dot: "bg-surface-400" },
+}
+
+function StageCard({ stage, index }: { stage: PlaybookStage; index: number }) {
+  const clr = STAGE_COLORS[stage.id] ?? STAGE_COLORS.closing
+  return (
+    <div className={`rounded-xl border ${clr.border} ${clr.bg} p-4 space-y-3`}>
+      {/* Header */}
+      <div className="flex items-center gap-2">
+        <span className={`w-5 h-5 rounded-full ${clr.dot} flex items-center justify-center text-white text-[10px] font-bold shrink-0`}>
+          {index + 1}
+        </span>
+        <span className="text-sm font-semibold text-surface-800">{stage.label}</span>
+        {stage.blocked_tools.length > 0 && (
+          <span className="ml-auto flex items-center gap-1 text-xs text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full">
+            <Lock size={10} />
+            {stage.blocked_tools.length} tool{stage.blocked_tools.length !== 1 ? "s" : ""} bloqueada{stage.blocked_tools.length !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+
+      {/* Goals */}
+      {stage.goals.length > 0 && (
+        <div>
+          <p className="text-[11px] font-medium text-surface-500 uppercase tracking-wide mb-1">Objetivos</p>
+          <ul className="space-y-0.5">
+            {stage.goals.map((g, i) => (
+              <li key={i} className="text-xs text-surface-700 flex items-start gap-1.5">
+                <ChevronRight size={10} className="mt-0.5 shrink-0 text-surface-400" />
+                {g}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Blocked tools */}
+      {stage.blocked_tools.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {stage.blocked_tools.map((t) => (
+            <span key={t} className="text-[10px] font-mono bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AbaAgente({ agent }: { agent: WaAgent | undefined }) {
+  const qc = useQueryClient()
+  const [jsonText, setJsonText]       = useState("")
+  const [jsonError, setJsonError]     = useState<string | null>(null)
+  const [showEditor, setShowEditor]   = useState(false)
+
+  const playbook: AgentPlaybook | null = agent?.agent_playbook ?? null
+
+  useEffect(() => {
+    if (agent?.agent_playbook) {
+      setJsonText(JSON.stringify(agent.agent_playbook, null, 2))
+    }
+  }, [agent])
+
+  const salvar = useMutation({
+    mutationFn: () => {
+      if (!agent) throw new Error("Agente não carregado")
+      let parsed: AgentPlaybook
+      try {
+        parsed = JSON.parse(jsonText)
+      } catch {
+        throw new Error("JSON inválido. Verifica a sintaxe antes de guardar.")
+      }
+      return agentesService.updatePlaybook(agent.id, parsed)
+    },
+    onSuccess: () => {
+      setJsonError(null)
+      qc.invalidateQueries({ queryKey: ["wa-agent"] })
+    },
+    onError: (e: Error) => setJsonError(e.message),
+  })
+
+  if (!agent) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 size={24} className="animate-spin text-brand-500" />
+      </div>
+    )
+  }
+
+  const stages: PlaybookStage[] = playbook?.stages ?? []
+
+  return (
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-surface-800">{agent.nome}</h2>
+          <p className="text-xs text-surface-400 mt-0.5">Playbook de conversa — state machine do agente</p>
+        </div>
+        <span className={`flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full font-medium ${
+          agent.ativo
+            ? "bg-emerald-50 text-emerald-700"
+            : "bg-surface-100 text-surface-500"
+        }`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${agent.ativo ? "bg-emerald-500" : "bg-surface-400"}`} />
+          {agent.ativo ? "Activo" : "Inactivo"}
+        </span>
+      </div>
+
+      {/* Health dashboard */}
+      <div className="border border-surface-100 rounded-xl px-4 py-4">
+        <AgentHealth />
+      </div>
+
+      {/* Stage flow */}
+      {stages.length > 0 ? (
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-surface-500 uppercase tracking-wide">Funil de conversa</p>
+          <div className="grid gap-2">
+            {stages.map((s, i) => (
+              <StageCard key={s.id} stage={s} index={i} />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-xl border border-dashed border-surface-200 p-6 text-center text-sm text-surface-400">
+          Nenhum stage configurado. Usa o editor JSON abaixo para configurar o playbook.
+        </div>
+      )}
+
+      {/* Sandbox tester */}
+      <div className="border border-surface-100 rounded-xl px-4 py-4 bg-surface-50/30">
+        <SandboxTester />
+      </div>
+
+      {/* JSON editor */}
+      <div className="border border-surface-100 rounded-xl overflow-hidden">
+        <button
+          onClick={() => setShowEditor((v) => !v)}
+          className="w-full flex items-center justify-between px-4 py-3 text-xs font-medium
+                     text-surface-500 hover:bg-surface-50 transition-colors"
+        >
+          <span>Editor JSON do playbook</span>
+          {showEditor ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+
+        {showEditor && (
+          <div className="px-4 pb-4 border-t border-surface-100 pt-4 space-y-3">
+            <textarea
+              value={jsonText}
+              onChange={(e) => { setJsonText(e.target.value); setJsonError(null) }}
+              rows={20}
+              spellCheck={false}
+              className="w-full font-mono text-xs rounded-lg border border-surface-200 bg-surface-50
+                         px-3 py-2.5 text-surface-900 focus:outline-none focus:ring-2
+                         focus:ring-brand-500/20 focus:border-brand-400 transition resize-y"
+            />
+
+            {(salvar.isError || jsonError) && (
+              <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-100 px-3 py-2.5 text-sm text-red-700">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                {jsonError ?? (salvar.error as Error)?.message}
+              </div>
+            )}
+
+            {salvar.isSuccess && (
+              <div className="flex items-center gap-2 rounded-lg bg-emerald-50 border border-emerald-100 px-3 py-2.5 text-sm text-emerald-700">
+                <CheckCircle2 size={14} />
+                Playbook guardado com sucesso.
+              </div>
+            )}
+
+            <button
+              onClick={() => salvar.mutate()}
+              disabled={salvar.isPending}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-surface-800 text-white
+                         text-sm font-medium hover:bg-surface-900 disabled:opacity-50 transition-colors"
+            >
+              {salvar.isPending ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+              Guardar playbook
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── KB Tab ───────────────────────────────────────────────────────────────────
+
+const CATEGORY_COLORS: Record<KbCategory, string> = {
+  empresa:      "bg-blue-50 text-blue-700 border-blue-100",
+  contato:      "bg-slate-50 text-slate-600 border-slate-100",
+  servico:      "bg-violet-50 text-violet-700 border-violet-100",
+  precificacao: "bg-amber-50 text-amber-700 border-amber-100",
+  faq:          "bg-emerald-50 text-emerald-700 border-emerald-100",
+  politica:     "bg-rose-50 text-rose-700 border-rose-100",
+}
+
+const KB_CATEGORIES = Object.keys(KB_CATEGORY_LABELS) as KbCategory[]
+
+interface KbFormState {
+  category: KbCategory
+  title: string
+  content: string
+}
+
+const EMPTY_FORM: KbFormState = { category: "empresa", title: "", content: "" }
+
+function AbaKB() {
+  const qc = useQueryClient()
+  const [editingId, setEditingId]   = useState<string | null>(null)
+  const [form, setForm]             = useState<KbFormState>(EMPTY_FORM)
+  const [showForm, setShowForm]     = useState(false)
+  const [filterCat, setFilterCat]   = useState<KbCategory | "">("")
+
+  const { data: entities = [], isLoading } = useQuery({
+    queryKey: ["kb-entities", filterCat],
+    queryFn: () => kbService.list(filterCat || undefined),
+    staleTime: 30_000,
+  })
+
+  const save = useMutation({
+    mutationFn: () => {
+      if (!form.title.trim() || !form.content.trim()) throw new Error("Título e conteúdo são obrigatórios.")
+      if (editingId) {
+        return kbService.update(editingId, { title: form.title, content: form.content, category: form.category })
+      }
+      return kbService.create(form as KbCreateDTO)
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["kb-entities"] })
+      setShowForm(false)
+      setEditingId(null)
+      setForm(EMPTY_FORM)
+    },
+  })
+
+  const deactivate = useMutation({
+    mutationFn: (id: string) => kbService.deactivate(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["kb-entities"] }),
+  })
+
+  function startEdit(e: KbEntity) {
+    setEditingId(e.id)
+    setForm({ category: e.category, title: e.title, content: e.content })
+    setShowForm(true)
+  }
+
+  function cancelForm() {
+    setShowForm(false)
+    setEditingId(null)
+    setForm(EMPTY_FORM)
+    save.reset()
+  }
+
+  // Group by category
+  const grouped = KB_CATEGORIES.reduce<Record<KbCategory, KbEntity[]>>((acc, cat) => {
+    acc[cat] = entities.filter((e) => e.category === cat && e.active)
+    return acc
+  }, {} as Record<KbCategory, KbEntity[]>)
+
+  return (
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-surface-800">Base de Conhecimento</h2>
+          <p className="text-xs text-surface-400 mt-0.5">
+            Informações que o agente consulta para responder pacientes
+          </p>
+        </div>
+        <button
+          onClick={() => { setShowForm(true); setEditingId(null); setForm(EMPTY_FORM) }}
+          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-brand-600 text-white text-xs
+                     font-medium hover:bg-brand-700 transition-colors"
+        >
+          <Plus size={13} /> Adicionar
+        </button>
+      </div>
+
+      {/* Category filter */}
+      <div className="flex flex-wrap gap-1.5">
+        <button
+          onClick={() => setFilterCat("")}
+          className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
+            filterCat === "" ? "bg-surface-800 text-white border-surface-800" : "bg-white text-surface-500 border-surface-200 hover:bg-surface-50"
+          }`}
+        >
+          Todos
+        </button>
+        {KB_CATEGORIES.map((cat) => (
+          <button
+            key={cat}
+            onClick={() => setFilterCat(cat === filterCat ? "" : cat)}
+            className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
+              filterCat === cat ? CATEGORY_COLORS[cat] + " font-semibold" : "bg-white text-surface-500 border-surface-200 hover:bg-surface-50"
+            }`}
+          >
+            {KB_CATEGORY_LABELS[cat]}
+          </button>
+        ))}
+      </div>
+
+      {/* Add/Edit form */}
+      {showForm && (
+        <div className="border border-brand-200 rounded-xl bg-brand-50/30 p-4 space-y-3">
+          <p className="text-xs font-semibold text-surface-700">
+            {editingId ? "Editar entrada" : "Nova entrada"}
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-surface-600 mb-1">Categoria</label>
+              <select
+                value={form.category}
+                onChange={(e) => setForm({ ...form, category: e.target.value as KbCategory })}
+                className="w-full rounded-lg border border-surface-200 bg-white px-3 py-2 text-sm text-surface-900 focus:outline-none focus:ring-2 focus:ring-brand-500/20"
+              >
+                {KB_CATEGORIES.map((c) => (
+                  <option key={c} value={c}>{KB_CATEGORY_LABELS[c]}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-surface-600 mb-1">Título</label>
+              <input
+                type="text"
+                value={form.title}
+                onChange={(e) => setForm({ ...form, title: e.target.value })}
+                placeholder="Ex: Quanto custa botox?"
+                className="w-full rounded-lg border border-surface-200 bg-white px-3 py-2 text-sm text-surface-900 focus:outline-none focus:ring-2 focus:ring-brand-500/20"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-surface-600 mb-1">Conteúdo</label>
+            <textarea
+              value={form.content}
+              onChange={(e) => setForm({ ...form, content: e.target.value })}
+              rows={5}
+              placeholder="Texto completo que o agente irá consultar..."
+              className="w-full rounded-lg border border-surface-200 bg-white px-3 py-2 text-sm text-surface-900 focus:outline-none focus:ring-2 focus:ring-brand-500/20 resize-y"
+            />
+          </div>
+          {save.isError && (
+            <p className="text-xs text-red-600 flex items-center gap-1">
+              <AlertCircle size={12} /> {(save.error as Error).message}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <button
+              onClick={() => save.mutate()}
+              disabled={save.isPending}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-surface-800 text-white text-xs font-medium hover:bg-surface-900 disabled:opacity-50"
+            >
+              {save.isPending ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+              Guardar
+            </button>
+            <button onClick={cancelForm} className="px-4 py-2 rounded-lg text-xs text-surface-500 hover:bg-surface-100">
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Entity list grouped by category */}
+      {isLoading ? (
+        <div className="flex items-center justify-center py-10">
+          <Loader2 size={20} className="animate-spin text-brand-500" />
+        </div>
+      ) : entities.filter((e) => e.active).length === 0 ? (
+        <div className="rounded-xl border border-dashed border-surface-200 p-8 text-center text-sm text-surface-400">
+          Nenhuma entrada na base de conhecimento. Clica em "Adicionar" para começar.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {KB_CATEGORIES.map((cat) => {
+            const rows = filterCat ? (filterCat === cat ? grouped[cat] : []) : grouped[cat]
+            if (rows.length === 0) return null
+            return (
+              <div key={cat}>
+                <p className="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-2">
+                  {KB_CATEGORY_LABELS[cat]} ({rows.length})
+                </p>
+                <div className="space-y-2">
+                  {rows.map((e) => (
+                    <div
+                      key={e.id}
+                      className={`rounded-lg border px-4 py-3 flex items-start gap-3 ${CATEGORY_COLORS[e.category]}`}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold truncate">{e.title}</p>
+                        <p className="text-xs opacity-70 mt-0.5 line-clamp-2">{e.content}</p>
+                      </div>
+                      <div className="flex gap-1 shrink-0">
+                        <button
+                          onClick={() => startEdit(e)}
+                          title="Editar"
+                          className="p-1.5 rounded hover:bg-black/10 transition-colors"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                        <button
+                          onClick={() => deactivate.mutate(e.id)}
+                          title="Desativar"
+                          className="p-1.5 rounded hover:bg-black/10 transition-colors opacity-60"
+                        >
+                          <EyeOff size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 
-type Aba = "whatsapp" | "kommo"
+type Aba = "whatsapp" | "kommo" | "agente" | "kb" | "versoes"
 
 const ABAS: { id: Aba; label: string; Icon: typeof MessageSquare }[] = [
   { id: "whatsapp", label: "WhatsApp / WAHA", Icon: MessageSquare },
   { id: "kommo",    label: "Kommo CRM",       Icon: Zap },
+  { id: "agente",   label: "Agente IA",       Icon: Bot },
+  { id: "kb",       label: "Conhecimento",    Icon: BookOpen },
+  { id: "versoes",  label: "Versões",         Icon: GitBranch },
 ]
 
 export function Configuracoes() {
   const [aba, setAba] = useState<Aba>("whatsapp")
 
-  const { data: integracoes = [], isLoading } = useQuery({
+  const { data: integracoes = [], isLoading: loadingIntegracoes } = useQuery({
     queryKey: ["integracoes"],
     queryFn: integracoesService.listar,
     staleTime: 30_000,
   })
 
-  const byTipo = Object.fromEntries(integracoes.map((i) => [i.tipo, i])) as Partial<Record<Aba, Integracao>>
+  const { data: agent, isLoading: loadingAgent } = useQuery({
+    queryKey: ["wa-agent"],
+    queryFn: agentesService.get,
+    staleTime: 60_000,
+    enabled: aba === "agente" || aba === "versoes",
+  })
+
+  // KB loading handled inside AbaKB component itself
+
+  const isLoading = loadingIntegracoes || (aba === "agente" && loadingAgent)
+  const byTipo = Object.fromEntries(integracoes.map((i) => [i.tipo, i])) as Partial<Record<"whatsapp" | "kommo", Integracao>>
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -533,8 +985,16 @@ export function Configuracoes() {
             </div>
           ) : aba === "whatsapp" ? (
             <AbaWhatsApp integracao={byTipo.whatsapp} />
-          ) : (
+          ) : aba === "kommo" ? (
             <AbaKommo integracao={byTipo.kommo} />
+          ) : aba === "agente" ? (
+            <AbaAgente agent={agent} />
+          ) : aba === "kb" ? (
+            <AbaKB />
+          ) : (
+            agent
+              ? <AgentVersions agentId={agent.id} />
+              : <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-brand-500" /></div>
           )}
         </div>
       </div>

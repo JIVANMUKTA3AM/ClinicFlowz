@@ -31,12 +31,22 @@
 
 services:
 
+  # ── Redis — debounce buffer WhatsApp ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: clinicflowz_redis
+    restart: unless-stopped
+    expose:
+      - "6379"
+
   # ── Backend FastAPI ──────────────────────────────────────────────────────────
   api:
     build: .
     container_name: clinicflowz_api
     restart: unless-stopped
     # Sem env_file — EasyPanel injeta todas as variáveis da aba "Ambiente".
+    environment:
+      REDIS_URL: redis://redis:6379   # serviço interno; não exposto ao exterior
     expose:
       - "8000"
     healthcheck:
@@ -72,5 +82,7 @@ services:
     expose:
       - "80"
     depends_on:
+      redis:
+        condition: service_started
       api:
         condition: service_healthy
