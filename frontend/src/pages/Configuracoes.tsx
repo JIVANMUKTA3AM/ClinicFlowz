@@ -926,7 +926,7 @@ export function Configuracoes() {
   // KB loading handled inside AbaKB component itself
 
   const isLoading = loadingIntegracoes || (aba === "agente" && loadingAgent)
-  const byTipo = Object.fromEntries(integracoes.map((i) => [i.tipo, i])) as Partial<Record<"whatsapp" | "kommo", Integracao>>
+  const byTipo = Object.fromEntries(integracoes.map((i) => [i.tipo, i])) as Partial<Record<Aba, Integracao>>
 
   return (
     <div className="max-w-2xl space-y-6">
