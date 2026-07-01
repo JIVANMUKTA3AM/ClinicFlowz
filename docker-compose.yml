@@ -46,7 +46,14 @@ services:
     restart: unless-stopped
     # Sem env_file — EasyPanel injeta todas as variáveis da aba "Ambiente".
     environment:
-      REDIS_URL: redis://redis:6379   # serviço interno; não exposto ao exterior
+      REDIS_URL:            redis://redis:6379   # serviço interno; não exposto ao exterior
+      SUPABASE_URL:         ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      ANTHROPIC_API_KEY:    ${ANTHROPIC_API_KEY}
+      WAHA_URL:             ${WAHA_URL}
+      WAHA_API_KEY:         ${WAHA_API_KEY}
+      ENCRYPTION_KEY:       ${ENCRYPTION_KEY}
+      BACKEND_WEBHOOK_URL:  ${BACKEND_WEBHOOK_URL}
     expose:
       - "8000"
     healthcheck:
