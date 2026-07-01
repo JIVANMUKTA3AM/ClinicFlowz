@@ -38,6 +38,7 @@ services:
     restart: unless-stopped
     expose:
       - "6379"
+    networks: [clinicflowz_net]
 
   # ── Backend FastAPI ──────────────────────────────────────────────────────────
   api:
@@ -56,6 +57,7 @@ services:
       BACKEND_WEBHOOK_URL:  ${BACKEND_WEBHOOK_URL}
     expose:
       - "8000"
+    networks: [clinicflowz_net]
     healthcheck:
       # python:3.12-slim não tem curl; urllib é stdlib — funciona sempre.
       test:
@@ -88,8 +90,13 @@ services:
     restart: unless-stopped
     expose:
       - "80"
+    networks: [clinicflowz_net]
     depends_on:
       redis:
         condition: service_started
       api:
         condition: service_healthy
+
+networks:
+  clinicflowz_net:
+    driver: bridge
