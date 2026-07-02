@@ -60,8 +60,8 @@ router = APIRouter()
 
 _BUFFER_TTL_SECONDS = 12
 
-# Stateless Router instance — shared across requests, thread-safe
-_router = Router(api_key=settings.ANTHROPIC_API_KEY)
+# Stateless Router instance — None when ANTHROPIC_API_KEY not configured
+_router: Router | None = Router(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
 
 
 # ─── Connection management ────────────────────────────────────────────────────
@@ -306,6 +306,9 @@ async def _process_turn(
             )
 
         # ── 4. Classify intent ──────────────────────────────────────────────
+        if _router is None:
+            logger.warning("WhatsApp agent inactivo: ANTHROPIC_API_KEY não configurada")
+            return
         route = await _router.classify(texto)
         logger.info(
             "Router → %s (confidence=%.0f%%, tier=%s) | patient=%s",

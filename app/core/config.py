@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
-    # Anthropic
-    ANTHROPIC_API_KEY: str
+    # Anthropic — opcional: app arranca sem ela; agentes de IA ficam inactivos
+    ANTHROPIC_API_KEY: str = ""
 
     # Waha (WhatsApp HTTP API) — opcionais; WhatsApp fica inactivo se não configurados
     WAHA_URL: str = ""       # ex: http://localhost:3000 ou http://IP_VPS:3000
