@@ -13,5 +13,5 @@ export interface CriarClinicaDTO {
 
 export const onboardingService = {
   criarClinica: (data: CriarClinicaDTO) =>
-    http.post<{ clinica_id: string }>("/api/v1/onboarding", data).then((r) => r.data),
+    http.post<{ clinica_id: string }>("/api/v1/onboarding/", data).then((r) => r.data),
 }
