@@ -22,6 +22,9 @@ RUN npm run build
 # ── Stage 2: serve ────────────────────────────────────────────────────────────
 FROM nginx:1.27-alpine
 
+ARG BUILD_DATE=unknown
+RUN echo "Build: $BUILD_DATE"
+
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx-spa.conf /etc/nginx/conf.d/default.conf
 

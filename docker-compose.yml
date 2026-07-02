@@ -86,6 +86,8 @@ services:
         VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
         # Vazio → o bundle usa URLs relativas (/api/...) → nginx faz o proxy.
         VITE_API_URL:           ""
+        # Incrementar para invalidar cache Docker do layer nginx
+        BUILD_DATE:             "2026-07-02-v4"
     container_name: clinicflowz_frontend
     restart: unless-stopped
     expose:
